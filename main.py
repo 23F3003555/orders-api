@@ -6,7 +6,7 @@ from collections import defaultdict, deque
 from threading import Lock
 from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import FastAPI, Header, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -28,12 +28,19 @@ class OrderInput(BaseModel):
     quantity: int = Field(default=1, ge=1)
 
 
-def check_rate_limit(client_id: str):
+@app.middleware("http")
+async def client_rate_limit(request: Request, call_next):
+    # Do not count browser CORS preflight requests.
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    client_id = request.headers.get("X-Client-Id", "anonymous")
     now = time.monotonic()
 
     with state_lock:
         bucket = rate_buckets[client_id]
 
+        # Remove requests outside the 10-second window.
         while bucket and now - bucket[0] >= WINDOW_SECONDS:
             bucket.popleft()
 
@@ -42,29 +49,17 @@ def check_rate_limit(client_id: str):
                 1,
                 int(WINDOW_SECONDS - (now - bucket[0]) + 0.999),
             )
-            raise HTTPException(
+
+            return JSONResponse(
                 status_code=429,
-                detail="Rate limit exceeded",
-                headers={"Retry-After": str(retry_after)},
+                content={"detail": "Rate limit exceeded"},
+                headers={
+                    "Retry-After": str(retry_after),
+                    "Cache-Control": "no-store",
+                },
             )
 
         bucket.append(now)
-
-
-@app.middleware("http")
-async def client_rate_limit(request: Request, call_next):
-    # CORS preflight requests do not consume rate-limit quota.
-    if request.method != "OPTIONS":
-        client_id = request.headers.get("X-Client-Id", "anonymous")
-
-        try:
-            check_rate_limit(client_id)
-        except HTTPException as exc:
-            return JSONResponse(
-                status_code=exc.status_code,
-                content={"detail": exc.detail},
-                headers=exc.headers,
-            )
 
     return await call_next(request)
 
@@ -84,6 +79,11 @@ def health():
     return {"status": "ok"}
 
 
+class OrderInput(BaseModel):
+    product: str = "sample-product"
+    quantity: int = Field(default=1, ge=1)
+
+
 @app.post("/orders", status_code=201)
 def create_order(
     body: OrderInput,
@@ -94,8 +94,10 @@ def create_order(
     ),
 ):
     with state_lock:
-        if idempotency_key in idempotency_store:
-            return idempotency_store[idempotency_key]
+        existing = idempotency_store.get(idempotency_key)
+
+        if existing is not None:
+            return existing
 
         order = {
             "id": str(uuid.uuid4()),
@@ -115,11 +117,11 @@ def encode_cursor(offset: int) -> str:
 def decode_cursor(cursor: str) -> int:
     try:
         padded = cursor + "=" * (-len(cursor) % 4)
-        offset = int(
-            base64.urlsafe_b64decode(
-                padded.encode("ascii")
-            ).decode("utf-8")
-        )
+        decoded = base64.urlsafe_b64decode(
+            padded.encode("ascii")
+        ).decode("utf-8")
+
+        offset = int(decoded)
 
         if offset < 0 or offset > TOTAL_ORDERS:
             raise ValueError("Invalid cursor")
@@ -127,6 +129,7 @@ def decode_cursor(cursor: str) -> int:
         return offset
 
     except Exception:
+        from fastapi import HTTPException
         raise HTTPException(
             status_code=400,
             detail="Invalid cursor",
@@ -164,7 +167,8 @@ def list_orders(
     }
 
 
-# Wrap the complete app so CORS headers also apply to error responses.
+# Wrap the entire application so CORS headers are added
+# to successful responses and rate-limit error responses.
 app = CORSMiddleware(
     app=app,
     allow_origins=["*"],
