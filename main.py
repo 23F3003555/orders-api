@@ -1,171 +1,106 @@
-
 import base64
+import threading
 import time
 import uuid
-from collections import defaultdict, deque
-from threading import Lock
-from typing import Optional
+from collections import deque
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Header, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
 
-
-app = FastAPI(title="Orders API")
-
-TOTAL_ORDERS = 46
-RATE_LIMIT = 16
+# ---- Your assigned values ----
+TOTAL_ORDERS = 46          # T
+RATE_LIMIT = 16            # R
 WINDOW_SECONDS = 10
 
-idempotency_store = {}
-rate_buckets = defaultdict(deque)
-state_lock = Lock()
+app = FastAPI()
 
-
-class OrderInput(BaseModel):
-    product: str = "sample-product"
-    quantity: int = Field(default=1, ge=1)
+# ---------- 3. Rate limiting (added FIRST so CORS wraps it) ----------
+hits = {}                  # client_id -> deque of request timestamps
+hits_lock = threading.Lock()
 
 
 @app.middleware("http")
-async def client_rate_limit(request: Request, call_next):
-    # CORS preflight requests must not consume rate-limit quota.
-    if request.method == "OPTIONS":
+async def rate_limiter(request: Request, call_next):
+    if request.method == "OPTIONS":      # CORS preflight is free
         return await call_next(request)
 
-    client_id = request.headers.get("X-Client-Id", "anonymous")
+    client_id = request.headers.get("x-client-id") or (
+        request.client.host if request.client else "anonymous"
+    )
     now = time.monotonic()
 
-    with state_lock:
-        bucket = rate_buckets[client_id]
-
-        # Keep only requests made within the last 10 seconds.
-        while bucket and now - bucket[0] >= WINDOW_SECONDS:
-            bucket.popleft()
-
-        if len(bucket) >= RATE_LIMIT:
-            retry_after = max(
-                1,
-                int(WINDOW_SECONDS - (now - bucket[0]) + 0.999),
-            )
-
-            response = JSONResponse(
+    with hits_lock:
+        dq = hits.setdefault(client_id, deque())
+        while dq and now - dq[0] >= WINDOW_SECONDS:   # forget old requests
+            dq.popleft()
+        if len(dq) >= RATE_LIMIT:
+            retry_after = max(1, int(WINDOW_SECONDS - (now - dq[0])) + 1)
+            return JSONResponse(
                 status_code=429,
-                content={"detail": "Rate limit exceeded"},
-                headers={
-                    "Retry-After": str(retry_after),
-                    "Cache-Control": "no-store",
-                },
+                content={"detail": "Too many requests"},
+                headers={"Retry-After": str(retry_after)},
             )
-            return response
-
-        bucket.append(now)
+        dq.append(now)
 
     return await call_next(request)
 
 
-@app.get("/")
-def root():
-    return {
-        "service": "orders-api",
-        "total_orders": TOTAL_ORDERS,
-        "rate_limit": RATE_LIMIT,
-        "window_seconds": WINDOW_SECONDS,
-    }
+# ---------- CORS (added LAST = outermost, so even 429s get CORS headers) ----------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Retry-After"],
+)
 
-
-@app.get("/healthz")
-def health():
-    return {"status": "ok"}
+# ---------- 1. Idempotent POST /orders ----------
+orders_by_key = {}         # idempotency key -> order
+orders_lock = threading.Lock()
 
 
 @app.post("/orders", status_code=201)
-def create_order(
-    body: OrderInput,
-    idempotency_key: str = Header(
-        ...,
-        alias="Idempotency-Key",
-        min_length=1,
-    ),
+async def create_order(
+    request: Request,
+    response: Response,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
-    with state_lock:
-        if idempotency_key in idempotency_store:
-            return idempotency_store[idempotency_key]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
 
-        order = {
-            "id": str(uuid.uuid4()),
-            "product": body.product,
-            "quantity": body.quantity,
-        }
-
-        idempotency_store[idempotency_key] = order
+    with orders_lock:
+        if idempotency_key and idempotency_key in orders_by_key:
+            return orders_by_key[idempotency_key]      # same order, no duplicate
+        order = {"id": f"ord_{uuid.uuid4().hex[:12]}", "details": body}
+        if idempotency_key:
+            orders_by_key[idempotency_key] = order
         return order
 
 
+# ---------- 2. Cursor pagination GET /orders ----------
 def encode_cursor(offset: int) -> str:
-    raw = str(offset).encode("utf-8")
-    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    return base64.urlsafe_b64encode(f"offset:{offset}".encode()).decode()
 
 
-def decode_cursor(cursor: str) -> int:
+def decode_cursor(cursor: str | None) -> int:
+    if not cursor:
+        return 0
     try:
-        padded = cursor + "=" * (-len(cursor) % 4)
-        decoded = base64.urlsafe_b64decode(
-            padded.encode("ascii")
-        ).decode("utf-8")
-
-        offset = int(decoded)
-
-        if offset < 0 or offset > TOTAL_ORDERS:
-            raise ValueError("Invalid cursor")
-
-        return offset
-
+        text = base64.urlsafe_b64decode(cursor.encode()).decode()
+        return max(0, int(text.split(":")[1]))
     except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid cursor",
-        )
+        return 0
 
 
 @app.get("/orders")
-def list_orders(
-    limit: int = Query(default=10, ge=1, le=46),
-    cursor: Optional[str] = None,
-):
-    offset = decode_cursor(cursor) if cursor else 0
+def list_orders(limit: int = 10, cursor: str | None = None):
+    limit = max(1, min(limit, 100))
+    start = decode_cursor(cursor)                 # 0-based position
+    end = min(start + limit, TOTAL_ORDERS)
 
-    catalog = [
-        {
-            "id": order_id,
-            "product": f"product-{order_id}",
-            "quantity": 1,
-        }
-        for order_id in range(1, TOTAL_ORDERS + 1)
-    ]
-
-    items = catalog[offset:offset + limit]
-    next_offset = offset + len(items)
-
-    next_cursor = (
-        encode_cursor(next_offset)
-        if next_offset < TOTAL_ORDERS
-        else None
-    )
-
-    return {
-        "items": items,
-        "next_cursor": next_cursor,
-    }
-
-
-# Wrap the complete application so CORS headers are added
-# to normal responses and rate-limit error responses.
-app = CORSMiddleware(
-    app=app,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    items = [{"id": i, "name": f"Order {i}"} for i in range(start + 1, end + 1)]
+    next_cursor = encode_cursor(end) if end < TOTAL_ORDERS else None
+    return {"items": items, "next_cursor": next_cursor}
