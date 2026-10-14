@@ -6,7 +6,7 @@ from collections import defaultdict, deque
 from threading import Lock
 from typing import Optional
 
-from fastapi import FastAPI, Header, Query, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -30,7 +30,7 @@ class OrderInput(BaseModel):
 
 @app.middleware("http")
 async def client_rate_limit(request: Request, call_next):
-    # Do not count browser CORS preflight requests.
+    # CORS preflight requests must not consume rate-limit quota.
     if request.method == "OPTIONS":
         return await call_next(request)
 
@@ -40,7 +40,7 @@ async def client_rate_limit(request: Request, call_next):
     with state_lock:
         bucket = rate_buckets[client_id]
 
-        # Remove requests outside the 10-second window.
+        # Keep only requests made within the last 10 seconds.
         while bucket and now - bucket[0] >= WINDOW_SECONDS:
             bucket.popleft()
 
@@ -50,7 +50,7 @@ async def client_rate_limit(request: Request, call_next):
                 int(WINDOW_SECONDS - (now - bucket[0]) + 0.999),
             )
 
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=429,
                 content={"detail": "Rate limit exceeded"},
                 headers={
@@ -58,6 +58,7 @@ async def client_rate_limit(request: Request, call_next):
                     "Cache-Control": "no-store",
                 },
             )
+            return response
 
         bucket.append(now)
 
@@ -79,11 +80,6 @@ def health():
     return {"status": "ok"}
 
 
-class OrderInput(BaseModel):
-    product: str = "sample-product"
-    quantity: int = Field(default=1, ge=1)
-
-
 @app.post("/orders", status_code=201)
 def create_order(
     body: OrderInput,
@@ -94,10 +90,8 @@ def create_order(
     ),
 ):
     with state_lock:
-        existing = idempotency_store.get(idempotency_key)
-
-        if existing is not None:
-            return existing
+        if idempotency_key in idempotency_store:
+            return idempotency_store[idempotency_key]
 
         order = {
             "id": str(uuid.uuid4()),
@@ -129,7 +123,6 @@ def decode_cursor(cursor: str) -> int:
         return offset
 
     except Exception:
-        from fastapi import HTTPException
         raise HTTPException(
             status_code=400,
             detail="Invalid cursor",
@@ -167,8 +160,8 @@ def list_orders(
     }
 
 
-# Wrap the entire application so CORS headers are added
-# to successful responses and rate-limit error responses.
+# Wrap the complete application so CORS headers are added
+# to normal responses and rate-limit error responses.
 app = CORSMiddleware(
     app=app,
     allow_origins=["*"],
