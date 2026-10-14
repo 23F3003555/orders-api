@@ -7,26 +7,17 @@ from threading import Lock
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
 app = FastAPI(title="Orders API")
 
-# Allow browser-based grader requests.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 TOTAL_ORDERS = 46
 RATE_LIMIT = 16
 WINDOW_SECONDS = 10
 
-# In-memory state. Use a single Render instance for this assignment.
 idempotency_store = {}
 rate_buckets = defaultdict(deque)
 state_lock = Lock()
@@ -49,7 +40,7 @@ def check_rate_limit(client_id: str):
         if len(bucket) >= RATE_LIMIT:
             retry_after = max(
                 1,
-                int(WINDOW_SECONDS - (now - bucket[0]) + 0.999)
+                int(WINDOW_SECONDS - (now - bucket[0]) + 0.999),
             )
             raise HTTPException(
                 status_code=429,
@@ -62,13 +53,13 @@ def check_rate_limit(client_id: str):
 
 @app.middleware("http")
 async def client_rate_limit(request: Request, call_next):
-    # Preflight requests should be handled by CORS, not counted.
+    # CORS preflight requests do not consume rate-limit quota.
     if request.method != "OPTIONS":
         client_id = request.headers.get("X-Client-Id", "anonymous")
+
         try:
             check_rate_limit(client_id)
         except HTTPException as exc:
-            from fastapi.responses import JSONResponse
             return JSONResponse(
                 status_code=exc.status_code,
                 content={"detail": exc.detail},
@@ -125,13 +116,21 @@ def decode_cursor(cursor: str) -> int:
     try:
         padded = cursor + "=" * (-len(cursor) % 4)
         offset = int(
-            base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+            base64.urlsafe_b64decode(
+                padded.encode("ascii")
+            ).decode("utf-8")
         )
+
         if offset < 0 or offset > TOTAL_ORDERS:
             raise ValueError("Invalid cursor")
+
         return offset
+
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid cursor")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid cursor",
+        )
 
 
 @app.get("/orders")
@@ -142,7 +141,11 @@ def list_orders(
     offset = decode_cursor(cursor) if cursor else 0
 
     catalog = [
-        {"id": order_id, "product": f"product-{order_id}", "quantity": 1}
+        {
+            "id": order_id,
+            "product": f"product-{order_id}",
+            "quantity": 1,
+        }
         for order_id in range(1, TOTAL_ORDERS + 1)
     ]
 
@@ -159,3 +162,13 @@ def list_orders(
         "items": items,
         "next_cursor": next_cursor,
     }
+
+
+# Wrap the complete app so CORS headers also apply to error responses.
+app = CORSMiddleware(
+    app=app,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
